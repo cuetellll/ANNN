@@ -1,0 +1,293 @@
+name: Build MahyarVPN
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: 'src-tauri -> target'
+
+      - name: Download sing-box 1.14 (Windows amd64)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $h = @{ Authorization = "Bearer $env:GH_TOKEN"; 'User-Agent' = 'mahyarvpn-ci' }
+          $rels = Invoke-RestMethod -Headers $h 'https://api.github.com/repos/SagerNet/sing-box/releases?per_page=100'
+          $rel = $rels | Where-Object { $_.tag_name -like 'v1.14.*' -and -not $_.prerelease } | Select-Object -First 1
+          if (-not $rel) { $rel = $rels | Where-Object { $_.tag_name -like 'v1.14.*' } | Select-Object -First 1 }
+          if (-not $rel) { throw 'sing-box 1.14 release not found' }
+          $asset = $rel.assets | Where-Object { $_.name -like '*-windows-amd64.zip' } | Select-Object -First 1
+          Write-Host "Using sing-box $($rel.tag_name) -> $($asset.name)"
+          Invoke-WebRequest $asset.browser_download_url -OutFile sb.zip
+          Expand-Archive sb.zip -DestinationPath sb -Force
+          New-Item -ItemType Directory -Force src-tauri/bin | Out-Null
+          Get-ChildItem sb -Recurse -Filter sing-box.exe | Select-Object -First 1 | Copy-Item -Destination src-tauri/bin/sing-box.exe
+          & ./src-tauri/bin/sing-box.exe version
+
+      - name: Download Aether (model 2, Windows x86_64)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # نسخه‌ی Aether؛ برای آخرین نسخه بذارش روی latest
+          AETHER_TAG: ${{ vars.AETHER_TAG || 'v1.5.0' }}
+        run: |
+          $h = @{ Authorization = "Bearer $env:GH_TOKEN"; 'User-Agent' = 'mahyarvpn-ci' }
+          $api = if ($env:AETHER_TAG -eq 'latest') { 'https://api.github.com/repos/CluvexStudio/Aether/releases/latest' } else { "https://api.github.com/repos/CluvexStudio/Aether/releases/tags/$env:AETHER_TAG" }
+          $rel = Invoke-RestMethod -Headers $h $api
+          $asset = $rel.assets | Where-Object { $_.name -like 'aether-windows-x86_64*.zip' } | Select-Object -First 1
+          if (-not $asset) { throw 'aether-windows-x86_64.zip not found in release' }
+          Write-Host "Using Aether $($rel.tag_name)"
+          Invoke-WebRequest $asset.browser_download_url -OutFile ae.zip
+          $sum = $rel.assets | Where-Object { $_.name -eq "$($asset.name).sha256" } | Select-Object -First 1
+          if ($sum) {
+            Invoke-WebRequest $sum.browser_download_url -OutFile ae.sha256
+            # فایل sha256 به‌صورت باینری میاد؛ باید از فایل متنی خونده بشه نه .Content
+            $want = ((Get-Content ae.sha256 -Raw).Trim() -split '\s+')[0].ToLower()
+            $got = (Get-FileHash ae.zip -Algorithm SHA256).Hash.ToLower()
+            if ($want -ne $got) { throw "Aether checksum mismatch: $got != $want" }
+            Write-Host 'checksum OK'
+          }
+          Expand-Archive ae.zip -DestinationPath ae -Force
+          $exe = Get-ChildItem ae -Recurse -Filter aether.exe | Select-Object -First 1
+          if (-not $exe) { throw 'aether.exe not found in zip' }
+          New-Item -ItemType Directory -Force src-tauri/bin/aether | Out-Null
+          # خود exe و هر DLL کنارش (bat و راهنما لازم نیست)
+          Get-ChildItem $exe.DirectoryName -File | Where-Object { $_.Extension -in '.exe', '.dll' } | Copy-Item -Destination src-tauri/bin/aether/
+          $files = Get-ChildItem src-tauri/bin/aether -File | Where-Object { $_.Name -ne '.gitkeep' }
+          if (-not $files) { throw 'no Aether files were copied into src-tauri/bin/aether' }
+          $files | Format-Table Name, Length
+
+      - name: Install frontend deps
+        run: npm install
+
+      - name: Build app
+        env:
+          VITE_GH_OWNER: ${{ github.repository_owner }}
+          VITE_GH_REPO: ${{ github.event.repository.name }}
+          VITE_SUB_URL: ${{ vars.SUB_URL }}
+        run: npm run tauri build
+
+      - name: Package (Setup + Portable)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force out/MahyarVPN-Portable | Out-Null
+          Copy-Item src-tauri/target/release/mahyarvpn.exe out/MahyarVPN-Portable/MahyarVPN.exe
+          Copy-Item src-tauri/bin/sing-box.exe out/MahyarVPN-Portable/sing-box.exe
+          Copy-Item src-tauri/bin/aether out/MahyarVPN-Portable/aether -Recurse
+          Compress-Archive -Path out/MahyarVPN-Portable/* -DestinationPath out/MahyarVPN-Portable.zip -Force
+          $setup = Get-ChildItem src-tauri/target/release/bundle/nsis/*.exe | Select-Object -First 1
+          Copy-Item $setup.FullName out/MahyarVPN-Setup.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MahyarVPN-Windows
+          path: |
+            out/MahyarVPN-Setup.exe
+            out/MahyarVPN-Portable.zip
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            out/MahyarVPN-Setup.exe
+            out/MahyarVPN-Portable.zip
+
+  # ------------------------------------------------------------------
+  # v2.6 · اندروید (APK برای arm64 و armv7)
+  # sing-box و Aether از ریلیز رسمی اندرویدشون، hev-socks5-tunnel با NDK بیلد میشه
+  # ------------------------------------------------------------------
+  android:
+    runs-on: ubuntu-latest
+    env:
+      JNI: src-tauri/mvpn-plugin/android/src/main/jniLibs
+      NDK_VERSION: 27.2.12479018
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK + build-tools
+        run: |
+          sdkmanager --install "ndk;${NDK_VERSION}" "build-tools;34.0.0" "platforms;android-34" > /dev/null
+          echo "NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> $GITHUB_ENV
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: 'src-tauri -> target'
+
+      - name: Download sing-box 1.14 (android arm64 + arm)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          rels=$(curl -sfL -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/SagerNet/sing-box/releases?per_page=100")
+          tag=$(echo "$rels" | jq -r '[.[] | select(.tag_name | startswith("v1.14.")) | select(.prerelease | not)][0].tag_name // empty')
+          if [ -z "$tag" ]; then tag=$(echo "$rels" | jq -r '[.[] | select(.tag_name | startswith("v1.14."))][0].tag_name // empty'); fi
+          [ -n "$tag" ] || { echo "sing-box 1.14 release not found"; exit 1; }
+          ver=${tag#v}
+          echo "Using sing-box $tag"
+          for pair in arm64:arm64-v8a arm:armeabi-v7a; do
+            a=${pair%%:*}; abi=${pair##*:}
+            curl -sfL -o sb.tgz "https://github.com/SagerNet/sing-box/releases/download/$tag/sing-box-$ver-android-$a.tar.gz"
+            rm -rf sbx && mkdir sbx && tar xzf sb.tgz -C sbx
+            mkdir -p $JNI/$abi
+            # اسمش باید lib*.so باشه تا اندروید نصبش کنه و اجازه‌ی اجرا بده
+            cp "$(find sbx -type f -name sing-box | head -1)" $JNI/$abi/libsingbox.so
+            rm -rf sbx sb.tgz
+          done
+          ls -la $JNI/*
+
+      - name: Download Aether (model 2, android arm64 + armv7)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AETHER_TAG: ${{ vars.AETHER_TAG || 'v1.5.0' }}
+        run: |
+          set -e
+          if [ "$AETHER_TAG" = "latest" ]; then api=https://api.github.com/repos/CluvexStudio/Aether/releases/latest; else api=https://api.github.com/repos/CluvexStudio/Aether/releases/tags/$AETHER_TAG; fi
+          rel=$(curl -sfL -H "Authorization: Bearer $GH_TOKEN" "$api")
+          echo "Using Aether $(echo "$rel" | jq -r .tag_name)"
+          for pair in arm64:arm64-v8a armv7:armeabi-v7a; do
+            a=${pair%%:*}; abi=${pair##*:}
+            name="aether-android-$a.tar.gz"
+            url=$(echo "$rel" | jq -r --arg n "$name" '.assets[] | select(.name == $n) | .browser_download_url')
+            if [ -z "$url" ]; then echo "::warning::$name not in release, model 2 disabled for $abi"; continue; fi
+            curl -sfL -o ae.tgz "$url"
+            sum=$(echo "$rel" | jq -r --arg n "$name.sha256" '.assets[] | select(.name == $n) | .browser_download_url')
+            if [ -n "$sum" ]; then
+              want=$(curl -sfL "$sum" | awk '{print tolower($1)}')
+              got=$(sha256sum ae.tgz | awk '{print $1}')
+              [ "$want" = "$got" ] || { echo "Aether checksum mismatch for $name"; exit 1; }
+              echo "$name checksum OK"
+            fi
+            rm -rf aex && mkdir aex && tar xzf ae.tgz -C aex
+            mkdir -p $JNI/$abi
+            cp "$(find aex -type f -name aether | head -1)" $JNI/$abi/libaether.so
+            rm -rf aex ae.tgz
+          done
+
+      - name: Build hev-socks5-tunnel (tun -> socks5, JNI)
+        run: |
+          set -e
+          mkdir -p /tmp/hev && cd /tmp/hev
+          git clone --recursive https://github.com/heiher/hev-socks5-tunnel
+          $NDK_HOME/ndk-build NDK_PROJECT_PATH=. APP_BUILD_SCRIPT=./hev-socks5-tunnel/Android.mk \
+            "APP_ABI=arm64-v8a armeabi-v7a" APP_PLATFORM=android-24 \
+            NDK_LIBS_OUT=/tmp/hev/libs NDK_OUT=/tmp/hev/obj \
+            "APP_CFLAGS=-O3 -DPKGNAME=com/mahyar/vpn/plugin" \
+            "APP_LDFLAGS=-Wl,--build-id=none -Wl,-z,max-page-size=16384"
+          cd $GITHUB_WORKSPACE
+          for abi in arm64-v8a armeabi-v7a; do
+            cp /tmp/hev/libs/$abi/libhev-socks5-tunnel.so $JNI/$abi/
+          done
+          ls -la $JNI/*
+
+      - name: Install frontend deps
+        run: npm install
+
+      - name: Init Android project
+        run: |
+          npx tauri android init --ci
+          npx tauri icon src-tauri/icons/icon.png
+          # فایل‌های اجرایی باید از APK بیرون کشیده بشن (nativeLibraryDir) تا قابل اجرا باشن
+          cat >> src-tauri/gen/android/app/build.gradle.kts <<'KTS'
+
+          android {
+              packaging {
+                  jniLibs {
+                      useLegacyPackaging = true
+                  }
+              }
+          }
+          KTS
+
+      - name: Build APK
+        env:
+          VITE_GH_OWNER: ${{ github.repository_owner }}
+          VITE_GH_REPO: ${{ github.event.repository.name }}
+          VITE_SUB_URL: ${{ vars.SUB_URL }}
+        run: npx tauri android build --apk --split-per-abi --target aarch64 armv7 --ci
+
+      - name: Sign APK
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          set -e
+          BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
+          mkdir -p out
+          if [ -n "$KS_B64" ]; then
+            echo "$KS_B64" | base64 -d > ks.jks
+          else
+            # بدون Secret یه کلید تازه ساخته میشه (Artifact «android-keystore» رو نگه دار و Secret کن، وگرنه آپدیت روی نسخه‌ی قبلی نصب نمیشه)
+            echo "::warning::ANDROID_KEYSTORE_B64 secret not set, generating a new signing key for this run"
+            KS_PASS=mahyarvpn; KS_ALIAS=mahyarvpn
+            keytool -genkeypair -keystore ks.jks -alias $KS_ALIAS -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass $KS_PASS -keypass $KS_PASS -dname "CN=MahyarVPN" -noprompt
+            mkdir -p keystore && cp ks.jks keystore/mahyarvpn.jks && base64 -w0 ks.jks > keystore/ANDROID_KEYSTORE_B64.txt
+            printf 'ANDROID_KEYSTORE_PASSWORD=mahyarvpn\nANDROID_KEY_ALIAS=mahyarvpn\n' > keystore/README.txt
+          fi
+          KS_ALIAS=${KS_ALIAS:-mahyarvpn}
+          for apk in $(find src-tauri/gen/android/app/build/outputs/apk -name '*-release*.apk'); do
+            case "$apk" in
+              *arm64*) n=MahyarVPN-android-arm64.apk ;;
+              *arm*)   n=MahyarVPN-android-armv7.apk ;;
+              *universal*) n=MahyarVPN-android-universal.apk ;;
+              *) continue ;;
+            esac
+            $BT/zipalign -p -f 4 "$apk" aligned.apk
+            $BT/apksigner sign --ks ks.jks --ks-key-alias "$KS_ALIAS" --ks-pass pass:$KS_PASS --key-pass pass:$KS_PASS --out out/$n aligned.apk
+            rm aligned.apk
+          done
+          rm -f ks.jks
+          ls -la out
+          [ -n "$(ls out/*.apk 2>/dev/null)" ] || { echo "no APK produced"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MahyarVPN-Android
+          path: out/*.apk
+
+      - uses: actions/upload-artifact@v4
+        if: hashFiles('keystore/README.txt') != ''
+        with:
+          name: android-keystore
+          path: keystore/
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*.apk
