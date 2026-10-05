@@ -1,0 +1,42 @@
+[package]
+name = "mahyarvpn"
+version = "2.6.0"
+description = "MahyarVPN - sing-box + Aether VPN client"
+edition = "2021"
+
+# v2.6: برای اندروید، کد اصلی یه کتابخونه‌ست (main.rs فقط صداش می‌زنه)
+[lib]
+name = "mahyarvpn_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = "2"
+
+# فقط دسکتاپ (ویندوز)
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-single-instance = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-notification = "2"
+# v2.5.4: اجرای Aether توی ترمینال مجازی (ConPTY)، مثل Aether-GUI
+portable-pty = "0.8"
+
+# فقط اندروید: پل VpnService
+[target.'cfg(target_os = "android")'.dependencies]
+tauri-plugin-mvpn = { path = "mvpn-plugin" }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

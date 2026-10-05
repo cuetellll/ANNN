@@ -1,0 +1,4 @@
+vless://UUID@your-server.com:443?encryption=none&security=reality&sni=www.speedtest.net&fp=chrome&pbk=PUBLIC_KEY&sid=SHORT_ID&type=tcp&flow=xtls-rprx-vision#🇩🇪 Germany Reality
+vless://UUID@cdn.your-domain.com:443?encryption=none&security=tls&sni=cdn.your-domain.com&type=ws&host=cdn.your-domain.com&path=%2Fws#🇳🇱 Netherlands WS
+trojan://PASSWORD@tr.your-domain.com:443?security=tls&sni=tr.your-domain.com&type=tcp#🇫🇮 Finland Trojan
+vmess://BASE64_JSON_HERE
